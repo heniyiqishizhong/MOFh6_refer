@@ -1,53 +1,169 @@
-import os
-import json
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import argparse
+import os
 import pandas as pd
+import requests
+import json
 import time
+import subprocess
+import traceback
 import shutil
-from elsapy.elsclient import ElsClient
-from elsapy.elsdoc import FullDoc
+import re
+import io
+
+from urllib.parse import urlparse
+from tqdm import tqdm
+
+# Selenium 相关
 from selenium.webdriver import Chrome, ChromeOptions
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
+
+# PDF 相关
+from PyPDF2 import PdfMerger
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+
+# PyMuPDF (fitz) 相关
+import fitz
+import logging
+from logging.handlers import RotatingFileHandler
+from dataclasses import dataclass
+from typing import Optional
+
+# 新增：Selenium 其它用到的组件（这部分你原脚本是有的，但防止遗漏）
 from selenium.webdriver.common.keys import Keys
 import zipfile
-import requests
-import re
 import pdfplumber
-import subprocess
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from selenium import webdriver
 
-# 加载配置文件，包含您的 API 密钥
-with open(r".../MOF_llm/referdemo/config.json") as con_file:
-    config = json.load(con_file)
+# ------------------ 新增：HTML 清洗工具函数 ------------------
+def remove_between_elsevier(html: str) -> str:
+    """
+    删除文本中第一个 'Elsevier' 到下一个 'Elsevier' 之间的内容（包含边界词），忽略大小写。
+    如需删除所有成对片段，把 count=1 去掉即可。
+    """
+    pattern = re.compile(r'elsevier.*?elsevier', flags=re.IGNORECASE | re.DOTALL)
+    cleaned = pattern.sub('', html, count=1)  # 只清一次；若想全删，去掉 count=1
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
 
-# 初始化客户端
-client = ElsClient(config['elsevierapikey'])
+@dataclass
+class ProcessingResult:
+    filename: str
+    success: bool
+    error_message: Optional[str] = None
+    output_path: Optional[str] = None
 
-parser = argparse.ArgumentParser(description='Elsevier Paper Crawler')
+class PDFProcessor:
+    """
+    用于提取 PDF 文本并进行简单的清洗，不使用多线程。
+    """
+    def __init__(self):
+        self.setup_logging()
+        
+    def setup_logging(self):
+        """Configure logging with rotation"""
+        log_file = 'file_processing.log'
+        self.logger = logging.getLogger('PDFProcessor')
+        self.logger.setLevel(logging.INFO)
+        
+        # 清除已存在的 handlers，避免重复
+        self.logger.handlers = []
+        
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=5*1024*1024, backupCount=5, encoding='utf-8'
+        )
+        file_handler.setFormatter(
+            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        )
+        
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(
+            logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        )
+        
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+
+    def extract_text_from_pdf(self, pdf_path: str) -> str:
+        """
+        使用 PyMuPDF (fitz) 从 PDF 中提取文本，并用正则去除多余换行/空格。
+        """
+        text_parts = []
+        try:
+            doc = fitz.open(pdf_path)
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                try:
+                    text = page.get_text("text")
+                    if text.strip():
+                        # 将多余的换行符替换为空格
+                        text = re.sub(r'\n+', ' ', text)
+                        text_parts.append(text)
+                except Exception as e:
+                    self.logger.warning(f"Failed to extract text from page {page_num + 1}: {str(e)}")
+                    continue
+            
+            doc.close()
+            
+            if not text_parts:
+                raise ValueError("No text could be extracted from any page.")
+            
+            combined_text = ' '.join(text_parts)
+            cleaned_text = re.sub(r'\s+', ' ', combined_text)
+            return cleaned_text.strip()
+            
+        except Exception as e:
+            raise ValueError(f"Failed to process PDF: {str(e)}")
+
+
+# ------------------------------- 下面是合并后的主脚本逻辑 -------------------------------
+
+# ========== 1. Springer 下载配置 ==========
+user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.6668.59 Safari/537.36"
+max_hits_per_minute = 300  # Springer API的请求速率限制
+
+# 读取 api_key
+config_path = './refer/config.json' 
+try:
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    api_key = config.get('springerapikey')
+    if not api_key:
+        print("未在 config.json 中找到 springerapikey")
+        exit()
+except FileNotFoundError:
+    print(f"配置文件未找到：{config_path}")
+    exit()
+except json.JSONDecodeError as e:
+    print(f"读取配置文件错误：{e}")
+    exit()
+
+# ========== 2. 路径配置 ==========
+parser = argparse.ArgumentParser(description='Elsevier Paper Crawler (with HTML->TXT cleaning)')
 parser.add_argument('input_file', help='Input Excel file path')
 args = parser.parse_args()
 # 1) 读取 Excel
-# 修改读取 Excel 的部分
 excel_path = args.input_file   # 使用命令行参数中的文件路径
 df = pd.read_excel(excel_path)  # 读取Excel文件
 # 2) 数据目录
-download_dir = r'.../MOF_llm/langgraghdemo/input'  
+download_dir = r'./langgragh/input'  
 
 # 提取所需的列：文件名标签、DOI 和文章 URL
 ccdc_codes = df.iloc[:, 0].tolist()  # 用于文件命名的标签
 dois = df.iloc[:, 11].tolist()        # DOI 列
 article_urls = df.iloc[:, 12].tolist() # 文章 URL 列
+
 #1
 # 定义用于处理支撑材料的函数
 def unzip_file(zip_path, extract_to):
     """
     解压 ZIP 文件到指定目录，并处理潜在的嵌套 ZIP 文件。
-    
-    :param zip_path: ZIP 文件的路径
-    :param extract_to: 解压目标目录
     """
     if not zipfile.is_zipfile(zip_path):
         print(f"警告: '{zip_path}' 不是一个有效的 ZIP 文件。跳过解压。")
@@ -142,8 +258,8 @@ def download_supporting_materials(browser, full_path):
             print(f"未找到任何匹配的元素，模式: {xpath}，错误: {e}")
 
 def start_libreoffice():#
-    # 启动 LibreOffice
-    subprocess.Popen([r'.../soffice.exe', '--headless', '--accept=socket,host=localhost,port=2002;urp;StarOffice.ComponentContext'])#
+    # 启动 LibreOffice（你可替换为实际绝对路径）
+    subprocess.Popen([r'.../soffice.exe', '--headless', '--accept=socket,host=localhost,port=2002;urp;StarOffice.ComponentContext'])
 
 def convert_to_pdf_with_unoconv(file_path):
     """使用 unoconv 将 .doc 和 .docx 文件转换为 PDF"""
@@ -221,37 +337,53 @@ for idx, (code, doi, url) in enumerate(zip(ccdc_codes, dois, article_urls)):
         print(f"文献 {code} 的 DOI 为空，跳过正文下载。")
         full_text_content = ""
     else:
-        doc = FullDoc(doi=doi)
-        if doc.read(client):
-            full_text = None
-            if 'full-text-retrieval-response' in doc.data:
-                ftrr = doc.data['full-text-retrieval-response']
-                if 'originalText' in ftrr:
-                    full_text = ftrr['originalText']
-                elif 'originalTextHtml' in ftrr:
-                    full_text = ftrr['originalTextHtml']
-            elif 'originalText' in doc.data:
-                full_text = doc.data['originalText']
-            elif 'originalTextHtml' in doc.data:
-                full_text = doc.data['originalTextHtml']
+        # 你需要提前初始化 ElsClient：client = ElsClient(config['elsevierapikey'])
+        # 这里仅保留你原脚本的读取逻辑
+        try:
+            from elsapy.elsclient import ElsClient
+            from elsapy.elsdoc import FullDoc
+            # 加载 Elsevier key
+            with open(r".../MOF_llm/referdemo/config.json") as con_file:
+                cfg2 = json.load(con_file)
+            client = ElsClient(cfg2['elsevierapikey'])
+        except Exception as e:
+            print(f"初始化 Elsevier 客户端出错：{e}")
+            client = None
 
-            if full_text:
-                if isinstance(full_text, dict):
-                    if '$' in full_text:
-                        full_text_content = full_text['$']
+        if client:
+            doc = FullDoc(doi=doi)
+            if doc.read(client):
+                full_text = None
+                if 'full-text-retrieval-response' in doc.data:
+                    ftrr = doc.data['full-text-retrieval-response']
+                    if 'originalText' in ftrr:
+                        full_text = ftrr['originalText']
+                    elif 'originalTextHtml' in ftrr:
+                        full_text = ftrr['originalTextHtml']
+                elif 'originalText' in doc.data:
+                    full_text = doc.data['originalText']
+                elif 'originalTextHtml' in doc.data:
+                    full_text = doc.data['originalTextHtml']
+
+                if full_text:
+                    if isinstance(full_text, dict):
+                        if '$' in full_text:
+                            full_text_content = full_text['$']
+                        else:
+                            full_text_content = json.dumps(full_text)
+                            print(f"full_text 的结构不符合预期，已将其转换为 JSON 字符串。")
+                    elif isinstance(full_text, str):
+                        full_text_content = full_text
                     else:
-                        full_text_content = json.dumps(full_text)
-                        print(f"full_text 的结构不符合预期，已将其转换为 JSON 字符串。")
-                elif isinstance(full_text, str):
-                    full_text_content = full_text
+                        full_text_content = str(full_text)
+                    print(f"文献 {code} 的正文已成功获取。")
                 else:
-                    full_text_content = str(full_text)
-                print(f"文献 {code} 的正文已成功获取。")
+                    print(f"文献 {code} 的全文不可用。")
+                    full_text_content = ""
             else:
-                print(f"文献 {code} 的全文不可用。")
+                print(f"无法读取文献 {code} 的数据。可能是 DOI 无效。")
                 full_text_content = ""
         else:
-            print(f"无法读取文献 {code} 的数据。可能是 DOI 无效。")
             full_text_content = ""
 
     # 处理支撑材料部分
@@ -283,9 +415,8 @@ for idx, (code, doi, url) in enumerate(zip(ccdc_codes, dois, article_urls)):
     options.add_experimental_option('prefs', prefs)
     options.add_experimental_option('excludeSwitches', ['enable-logging'])  # 禁止日志打印
 
-
-    # 指定 ChromeDriver 的路径
-    chrome_driver_path = r'.../chromedriver.exe'  # 替换为你的chromedriver路径
+    # 指定 ChromeDriver 的路径（请替换为你的绝对路径）
+    chrome_driver_path = r'.../chromedriver.exe'
     service = Service(executable_path=chrome_driver_path)
 
     # 初始化 Chrome 浏览器
@@ -294,7 +425,6 @@ for idx, (code, doi, url) in enumerate(zip(ccdc_codes, dois, article_urls)):
 
     # 等待页面加载完成
     wait = WebDriverWait(browser, 20)
-    # 根据需要等待特定元素加载，这里以页面主体为例
     wait.until(EC.presence_of_element_located((By.TAG_NAME, 'body')))
 
     # 滚动页面以确保元素加载完毕
@@ -307,7 +437,7 @@ for idx, (code, doi, url) in enumerate(zip(ccdc_codes, dois, article_urls)):
     download_supporting_materials(browser, full_path)
     browser.quit()
 
-     # 解压下载的 zip 文件
+    # 解压下载的 zip 文件
     zip_files = [file for file in os.listdir(full_path) if file.lower().endswith('.zip')]
     if zip_files:
         for file in zip_files:
@@ -325,13 +455,11 @@ for idx, (code, doi, url) in enumerate(zip(ccdc_codes, dois, article_urls)):
     # 将所有 PDF 文件转换为 HTML 内容
     supporting_materials_html_content = convert_files_to_html(full_path)
 
-    # 删除处理过程中的临时文件
+    # 删除处理过程中的临时文件（PDF/Doc等）
     delete_non_html_files(full_path)
     shutil.rmtree(full_path)
-    #os.rmdir(full_path)  # 删除空目录
 
-    # 合并正文和支撑
-    # 材料内容
+    # 合并正文和支撑材料为 HTML
     combined_html_content = "<html><body>\n"
     combined_html_content += "<h1>Manuscript</h1>\n"
     combined_html_content += full_text_content
@@ -344,6 +472,34 @@ for idx, (code, doi, url) in enumerate(zip(ccdc_codes, dois, article_urls)):
     with open(filename, "w", encoding="utf-8") as file:
         file.write(combined_html_content)
     print(f"合并后的 HTML 内容已保存到 {filename}")
+
+    # ========== 新增：清洗 HTML -> 输出 TXT -> 删除 HTML ==========
+    try:
+        html_file_path = filename
+        html_filename = os.path.basename(html_file_path)
+
+        # 读取 HTML 文件内容
+        with open(html_file_path, "r", encoding="utf-8") as f:
+            html_content = f.read()
+
+        # 清洗（删除 'Elsevier' 到 'Elsevier' 之间的内容）
+        cleaned_text = remove_between_elsevier(html_content)
+
+        # 保存为 .txt（与 .html 同目录）
+        txt_filename = html_filename.replace('.html', '.txt')
+        txt_file_path = os.path.join(download_dir, txt_filename)
+        with open(txt_file_path, "w", encoding="utf-8") as txt_file:
+            txt_file.write(cleaned_text)
+        print(f"清洗后的 TXT 内容已保存到 {txt_file_path}")
+    except Exception as e:
+        print(f"处理 HTML 文件 {html_filename} 时出错: {e}")
+
+    # 删除 HTML 文件，只保留 TXT 文件
+    try:
+        os.remove(html_file_path)  # 删除生成的 HTML 文件
+        print(f"已删除 HTML 文件: {html_file_path}")
+    except Exception as e:
+        print(f"删除 HTML 文件时出错: {e}")
 
     # 避免过于频繁的请求
     time.sleep(1)
