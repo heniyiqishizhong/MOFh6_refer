@@ -124,18 +124,17 @@ class PDFProcessor:
 
 # ------------------------------- 下面是合并后的主脚本逻辑 -------------------------------
 
-# ========== 1. Springer 下载配置 ==========
 user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.6668.59 Safari/537.36"
-max_hits_per_minute = 300  # Springer API的请求速率限制
+max_hits_per_minute = 300  
 
 # 读取 api_key
 config_path = './refer/config.json' 
 try:
     with open(config_path, 'r') as f:
         config = json.load(f)
-    api_key = config.get('springerapikey')
+    api_key = config.get('elsevierapikey')
     if not api_key:
-        print("未在 config.json 中找到 springerapikey")
+        print("未在 config.json 中找到 elsevierapikey")
         exit()
 except FileNotFoundError:
     print(f"配置文件未找到：{config_path}")
@@ -505,3 +504,4 @@ for idx, (code, doi, url) in enumerate(zip(ccdc_codes, dois, article_urls)):
     time.sleep(1)
 
 print('下载和合并完成')
+
