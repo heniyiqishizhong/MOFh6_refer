@@ -103,10 +103,10 @@ args = parser.parse_args()
 excel_path = args.input_file   # 使用命令行参数中的文件路径
 df = pd.read_excel(excel_path)  # 读取Excel文件
 # 2) 数据目录
-download_dir = r'.../MOF_llm/langgraghdemo/input' 
+download_dir = r'./langgragh/input' 
 
 # 读取 client_token
-config_path = r'.../MOF_llm/referdemo/config.json'
+config_path = r'./refer/config.json'
 
 # 读取 client_token
 try:
@@ -197,7 +197,7 @@ for idx, (code, doi, url) in enumerate(zip(ccdc_code, article_doi, article_url),
                 continue
         pbar.update(1)
 
-        chrome_driver_path = 'D:\\Program Files\\ChromeDriver\\chromedriver.exe'  
+        chrome_driver_path = '...\\chromedriver.exe'  
         # 使用 Selenium 下载补充材料
         supplementary_downloaded = False
         options = ChromeOptions()
